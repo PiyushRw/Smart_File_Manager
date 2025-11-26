@@ -49,4 +49,87 @@ Built with **Python, TensorFlow, Tkinter, FAISS-like classification logic, and s
 ---
 
 ## 📂 Project Structure
+.
+├── file_organizer.py
+├── README.md # 
 
+---
+
+## ▶️ How to Run
+
+### 1. Install dependencies:
+
+pip install tensorflow pillow matplotlib pandas numpy scikit-learn
+
+ 
+### 2. Run the application:
+
+python file_organizer.py
+
+🧠 How It Works
+1. Classification Engine
+
+The DeepLearningClassifier intelligently categorizes files by:
+
+Checking the file extension against predefined category mappings
+
+Optionally classifying images using MobileNetV2 for deeper semantic detection
+
+Falling back to “Other” for unknown file types
+
+
+file_organizer
+
+2. AI-Assisted File Organization
+
+The FileOrganizer moves files into subfolders based on classification and logs each operation:
+
+Handles collisions by renaming duplicates
+
+Tracks number of files per category
+
+Generates a full organization report
+
+
+file_organizer
+
+3. Professional GUI
+
+FileOrganizerGUI provides:
+
+Directory picker
+
+Real-time progress updates
+
+Activity log window
+
+Pie chart and bar chart summary
+
+Configurable settings such as enabling/disabling subfolder creation
+
+
+🗂️ Supported File Types
+Images
+
+.jpg, .jpeg, .png, .gif, .bmp, .svg, .webp, .tiff
+
+Documents
+
+.pdf, .docx, .txt, .xls, .ppt, etc.
+
+Videos, Audio, Archives, Code, Data, Executables
+
+(mp4, mp3, zip, py, js, csv, exe, etc.)
+— Fully configurable via the category mapping in the source code.
+
+📌 Future Enhancements (Ideas)
+
+Add FAISS vector indexing for semantic file similarity
+
+Add cloud backup integration
+
+Add face/object recognition for photo files
+
+Add scheduling for auto-cleanup
+
+Add drag-and-drop UI support
