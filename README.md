@@ -41,7 +41,7 @@ A modern, AI-powered desktop application for organizing files intelligently usin
 
 ```bash
 git clone <your-repo-url>
-cd smart-file-organizer
+cd <repo-name>
 ```
 
 ### Step 2: Create Virtual Environment (Recommended)
