@@ -1,644 +1,615 @@
+"""
+logic.py — Core file-organiser pipeline for ai_file.
+
+``FileOrganizer`` orchestrates the full workflow:
+  1. Scan source folders for supported files.
+  2. Extract text content from each file.
+  3. Extract noun-phrase keywords from the text using spaCy.
+  4. Compute semantic similarity against the user's query keywords using
+     SentenceTransformer embeddings.
+  5. Determine the destination folder (category + optional keyword sub-folder).
+  6. Safely move the file: copy → verify → delete original.
+  7. Record the action in a persistent Pandas DataFrame registry.
+
+Parallel processing
+-------------------
+  File extraction + classification runs in a ``ThreadPoolExecutor`` (I/O-bound
+  work benefits from threading in CPython; GIL is released during file I/O
+  and by native extensions such as torch and easyocr).
+
+Safe move strategy (copy-then-delete)
+--------------------------------------
+  ``safe_copy_then_delete()`` uses ``shutil.copy2`` (preserves metadata) and
+  verifies the destination file size before removing the source.  If
+  verification fails, the partial copy is deleted and the source is preserved.
+
+Pause / Resume / Cancel
+-----------------------
+  The organiser checks ``threading.Event`` objects between file-processing
+  futures so the GUI can pause, resume, or cancel a live run without killing
+  worker threads mid-write.
+"""
+
+from __future__ import annotations
+
+import logging
 import os
-import pandas as pd
-import easyocr
+import pickle
 import shutil
-import spacy
-import torch
-from collections import Counter
-from sentence_transformers import SentenceTransformer, util
-from faster_whisper import WhisperModel
-from moviepy.editor import VideoFileClip, AudioFileClip
-from markitdown import MarkItDown
-from pptx import Presentation
-from PIL import Image
-import io
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Set
 
-# Initialize tools
-md = MarkItDown()
-ocr = easyocr.Reader(['en'], gpu=False)
-nlp = spacy.load("en_core_web_sm", disable=["parser", "ner"])
-model = SentenceTransformer('all-MiniLM-L6-v2')
-whisper = WhisperModel("base", device="cpu", compute_type="int8")
+import numpy as np
+import pandas as pd
+import spacy                                    # type: ignore
+from sklearn.metrics.pairwise import cosine_similarity
 
-EXTENSION_MAP = {
-    "Images": [".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".webp"],
-    "Documents": [".pdf", ".docx", ".doc", ".txt", ".md", ".xlsx", ".csv", ".pptx"],
-    "Audio": [".mp3", ".wav", ".flac", ".m4a", ".aac"],
-    "Video": [".mp4", ".mov", ".mkv", ".avi", ".webm"],
-    "Archives": [".zip", ".rar", ".7z", ".tar", ".gz"],
-    "Executables": [".exe", ".msi", ".bat", ".sh", ".app"],
-    "Code": [".py", ".js", ".html", ".css", ".java", ".cpp"]
+from .config import AppConfig
+from .categorizer import FileCategorizer
+from .extractor import extract_text, is_supported, validate_text
+from .utils import get_sentence_model
+
+logger = logging.getLogger("ai_file.logic")
+
+# Words to strip from user queries — action verbs, prepositions, function words.
+# Only true nouns/noun phrases should survive as keyword folder names.
+QUERY_ACTION_WORDS: Set[str] = {
+    "organise", "organize", "sort", "match", "find", "search", "locate",
+    "move", "copy", "transfer", "put", "place", "arrange", "group",
+    "categorize", "categorise", "filter", "select", "show", "list",
+    "get", "make", "create", "do", "use", "want", "need", "help",
+    "please", "check", "scan", "process", "run", "start", "begin",
+    "go", "take", "give", "look", "manage", "handle", "detect",
+    "index", "rename", "delete", "remove", "all", "my", "the",
+    "file", "files", "folder", "folders", "document", "documents",
 }
 
-GENERIC_IGNORE = {"page", "date", "file", "total", "text", "format", "number", "datum", "sheet"}
+# ---------------------------------------------------------------------------
+# spaCy — loaded lazily to avoid blocking on import
+# ---------------------------------------------------------------------------
+
+_nlp: Optional[object] = None
+_nlp_lock = threading.Lock()
 
 
-def _log(message, callback=None):
-    """Helper to print or callback"""
-    if callback:
-        callback(message)
-    else:
-        print(message)
+def _get_nlp():
+    global _nlp
+    if _nlp is None:
+        with _nlp_lock:
+            if _nlp is None:
+                logger.info("Loading spaCy model 'en_core_web_sm' …")
+                _nlp = spacy.load("en_core_web_sm")
+                logger.info("spaCy ready.")
+    return _nlp
 
 
-def extract_images_from_pptx(pptx_path):
+# ---------------------------------------------------------------------------
+# NLP helpers
+# ---------------------------------------------------------------------------
+
+def extract_phrases(text: str, nouns_only: bool = False) -> List[str]:
     """
-    Extract all images from a PowerPoint file and run OCR on them.
-    
-    Args:
-        pptx_path: Path to .pptx file
-        
-    Returns:
-        Combined text from all images in the presentation
+    Extract meaningful noun-phrase keyword strings from *text*.
+
+    Uses spaCy noun chunks, filters determiners/pronouns, and deduplicates.
+
+    Parameters
+    ----------
+    text:
+        Any plain-text string (capped to 100 000 chars).
+    nouns_only:
+        If ``True``, apply strict filtering suitable for query keyword
+        extraction: drop action verbs, function words, and any phrase
+        that appears in ``QUERY_ACTION_WORDS``.  Only NOUN / PROPN
+        chunk roots are retained.
+
+    Returns
+    -------
+    List[str]
+        Ordered, deduplicated list of lowercase keyword phrases.
     """
-    all_image_text = []
-    
-    try:
-        prs = Presentation(pptx_path)
-        
-        for slide_num, slide in enumerate(prs.slides):
-            for shape in slide.shapes:
-                # Check if shape contains an image
-                if hasattr(shape, "image"):
-                    try:
-                        # Get image bytes
-                        image_bytes = shape.image.blob
-                        
-                        # Convert to PIL Image
-                        image = Image.open(io.BytesIO(image_bytes))
-                        
-                        # Save temporarily for OCR
-                        temp_image_path = f"temp_ppt_image_{slide_num}.png"
-                        image.save(temp_image_path)
-                        
-                        # Run OCR
-                        text_list = ocr.readtext(temp_image_path, detail=0)
-                        if text_list:
-                            all_image_text.extend(text_list)
-                        
-                        # Clean up temp file
-                        if os.path.exists(temp_image_path):
-                            os.remove(temp_image_path)
-                            
-                    except Exception as e:
-                        # Skip problematic images
-                        continue
-                        
-    except Exception as e:
-        # If can't process PPTX, return empty
-        return ""
-    
-    return " ".join(all_image_text)
+    if not text or not text.strip():
+        return []
 
+    nlp = _get_nlp()
+    doc = nlp(text[:100_000])
 
-def extract_text(file_type, file_path):
-    """Extract text from various file types (Documents, Images, Audio, Video).
-    
-    ENHANCED: Now extracts text from images inside PowerPoint files.
-    INCREASED: Word limit raised to 500 words for better semantic matching.
-    """
-    text = ""
-    try:
-        # --- A. DOCUMENTS ---
-        if file_type == "Documents":
-            if file_path.endswith(".txt") or file_path.endswith(".csv"):
-                with open(file_path, 'r', encoding='utf-8', errors="ignore") as f:
-                    text = f.read(5000)  # Increased from 2000 to 5000 characters
-            elif file_path.endswith(".pptx"):
-                # Extract text from slides using MarkItDown
-                result = md.convert(file_path)
-                if result:
-                    text = result.text_content
-                
-                # ENHANCED: Also extract text from images inside the PPTX
-                image_text = extract_images_from_pptx(file_path)
-                if image_text:
-                    text += " " + image_text
-            else:
-                # Other document types (PDF, DOCX, etc.)
-                result = md.convert(file_path)
-                if result:
-                    text = result.text_content
+    seen: Set[str] = set()
+    phrases: List[str] = []
 
-        # --- B. IMAGES ---
-        elif file_type == "Images":
-            text_list = ocr.readtext(file_path, detail=0)
-            text = " ".join(text_list)
-
-        # --- C. AUDIO & VIDEO ---
-        elif file_type == "Audio" or file_type == "Video":
-            audio_path = file_path
-            temp_audio = "temp_scan.wav"
-            CUTOFF_SEC = 150
-            created_temp = False
-
-            try:
-                clip = None
-                if file_type == "Video":
-                    clip = VideoFileClip(file_path)
-                else:
-                    clip = AudioFileClip(file_path)
-
-                if clip.duration:
-                    duration_to_read = min(clip.duration, CUTOFF_SEC)
-                    sub_clip = clip.subclip(0, duration_to_read)
-                    
-                    if file_type == "Video":
-                        sub_clip.audio.write_audiofile(temp_audio, verbose=False, logger=None)
-                    else:
-                        sub_clip.write_audiofile(temp_audio, verbose=False, logger=None)
-                    
-                    sub_clip.close()
-                    clip.close()
-                    
-                    audio_path = temp_audio
-                    created_temp = True
-                else:
-                    clip.close()
-
-            except Exception:
-                pass  # Silent fail for trimming
-            
-            segments, _ = whisper.transcribe(audio_path, beam_size=5)
-            text = " ".join([segment.text for segment in segments])
-
-            if created_temp and os.path.exists(temp_audio):
-                os.remove(temp_audio)
-
-    except Exception:
-        return ""
-
-    # Truncate to 500 words (increased from 200 for better semantic matching)
-    if text:
-        words = text.split()
-        preview = " ".join(words[:500])  # Increased from 200 to 500
-        return preview
-    
-    return ""
-
-
-def scan_folder(folder_path, progress_callback=None, include_subfolders=True):
-    """
-    Scan folder and extract metadata + preview text for all files.
-    
-    Args:
-        folder_path: Path to folder to scan
-        progress_callback: Optional function(message) for progress updates
-        include_subfolders: If True, scan subdirectories; if False, scan only top level
-    """
-    data = []
-    file_count = 0
-    
-    # Choose scanning method based on include_subfolders
-    if include_subfolders:
-        # First, count total files (including subfolders)
-        total_files = sum([len(files) for _, _, files in os.walk(folder_path)])
-        
-        # Scan all folders and subfolders
-        for root, _, files in os.walk(folder_path):
-            for file in files:
-                file_count += 1
-                file_path = os.path.join(root, file)
-                ext = os.path.splitext(file)[1].lower()
-                
-                # Determine Category
-                category = "Others"
-                for cat, extensions in EXTENSION_MAP.items():
-                    if ext in extensions:
-                        category = cat
-                        break
-                
-                # Progress update
-                if progress_callback and file_count % 10 == 0:  # Update every 10 files
-                    progress_callback(f"⏳ Processing: {file_count}/{total_files} files...")
-                
-                # Extract Preview Text
-                preview_text = ""
-                if category in ["Documents", "Images", "Audio", "Video"]:
-                    if progress_callback:
-                        progress_callback(f"📄 Analyzing: {file}")
-                    preview_text = extract_text(category, file_path)
-                
-                data.append({
-                    "Filename": file,
-                    "Category": category,
-                    "Path": file_path,
-                    "Preview": preview_text
-                })
-    else:
-        # Scan only the top-level folder (no subdirectories)
-        try:
-            files = [f for f in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, f))]
-            total_files = len(files)
-            
-            for file in files:
-                file_count += 1
-                file_path = os.path.join(folder_path, file)
-                ext = os.path.splitext(file)[1].lower()
-                
-                # Determine Category
-                category = "Others"
-                for cat, extensions in EXTENSION_MAP.items():
-                    if ext in extensions:
-                        category = cat
-                        break
-                
-                # Progress update
-                if progress_callback and file_count % 10 == 0:
-                    progress_callback(f"⏳ Processing: {file_count}/{total_files} files...")
-                
-                # Extract Preview Text
-                preview_text = ""
-                if category in ["Documents", "Images", "Audio", "Video"]:
-                    if progress_callback:
-                        progress_callback(f"📄 Analyzing: {file}")
-                    preview_text = extract_text(category, file_path)
-                
-                data.append({
-                    "Filename": file,
-                    "Category": category,
-                    "Path": file_path,
-                    "Preview": preview_text
-                })
-        except Exception as e:
-            if progress_callback:
-                progress_callback(f"❌ Error scanning folder: {e}")
-    
-    if progress_callback:
-        progress_callback(f"✅ Scanned {file_count} files")
-    
-    return pd.DataFrame(data)
-
-
-def extract_keywords_from_preview(df, progress_callback=None):
-    """
-    Extract top 20 keywords from Preview text for semantic matching.
-    Creates a new 'Keywords' column with comma-separated keywords.
-    
-    INCREASED: From 10 to 20 keywords for better semantic accuracy.
-    
-    Args:
-        df: DataFrame with file data
-        progress_callback: Optional function(message) for progress updates
-    """
-    _log("📝 Extracting keywords from preview text...", progress_callback)
-    keywords_list = []
-    
-    # INCREASED: Top 20 keywords for better matching (was 10)
-    TOP_KEYWORDS = 20
-    
-    for idx, row in df.iterrows():
-        if progress_callback and idx % 50 == 0:
-            progress_callback(f"🔍 Extracting keywords: {idx}/{len(df)} files...")
-            
-        preview_text = row['Preview']
-        
-        if not preview_text or row['Category'] == "Others":
-            keywords_list.append("")
+    for chunk in doc.noun_chunks:
+        # Skip chunks whose root is a verb or auxiliary
+        if nouns_only and chunk.root.pos_ not in ("NOUN", "PROPN", "NUM"):
             continue
-            
-        # Process with spaCy
-        doc = nlp(preview_text)
-        
-        # Extract meaningful words
-        words = [
-            token.lemma_ for token in doc 
-            if token.pos_ in ["NOUN", "PROPN", "VERB", "ADJ"]
-            and not token.is_stop 
-            and not token.is_punct 
-            and len(token.text) > 2
-            and token.lemma_ not in GENERIC_IGNORE
-        ]
-        
-        # Get top 20 most common keywords (increased from 10)
-        if words:
-            top_words = [word for word, count in Counter(words).most_common(TOP_KEYWORDS)]
-            keywords_list.append(", ".join(top_words))
-        else:
-            keywords_list.append("")
-    
-    df['Keywords'] = keywords_list
-    _log("✅ Keywords extracted!", progress_callback)
-    return df
-
-
-def refine_categories_with_semantic_search(df, user_query, progress_callback=None):
-    """
-    Match files to user-specified categories using semantic similarity.
-    
-    LOGIC:
-    1. Extract categories from user query (e.g., "Invoice", "Legal", "Medical")
-    2. Extract top 20 keywords from each file's content (increased from 10)
-    3. Compare file keywords with query categories using AI embeddings
-    4. If similarity > 0.45 → Update category to matched query category
-    5. If similarity < 0.45 → Keep original extension-based category
-    
-    Args:
-        df: DataFrame with file data
-        user_query: User's categorization query
-        progress_callback: Optional function(message) for progress updates
-    """
-    # Extract target categories from user query
-    target_categories = get_categories_from_query(user_query)
-    if not target_categories:
-        _log("⚠️ No target categories found in query.", progress_callback)
-        return df
-
-    _log(f"🎯 Matching files against: {target_categories}", progress_callback)
-
-    # Ensure Keywords column exists
-    if 'Keywords' not in df.columns:
-        _log("📝 Extracting keywords first...", progress_callback)
-        df = extract_keywords_from_preview(df, progress_callback)
-
-    # Encode query categories into AI embeddings
-    target_embeddings = model.encode(target_categories, convert_to_tensor=True)
-    refined_categories = []
-
-    for idx, row in df.iterrows():
-        if progress_callback and idx % 25 == 0:
-            progress_callback(f"🔍 Semantic matching: {idx}/{len(df)} files...")
-            
-        file_keywords = row['Keywords']
-        original_category = row['Category']
-        
-        # Skip if no keywords or already marked as Others
-        if not file_keywords or original_category == "Others":
-            refined_categories.append(original_category)
+        # Drop determiners, pronouns, and (in nouns_only mode) verbs
+        skip_pos = ("DET", "PRON", "VERB", "AUX") if nouns_only else ("DET", "PRON")
+        tokens = [t.text for t in chunk if t.pos_ not in skip_pos]
+        phrase = " ".join(tokens).strip().lower()
+        # In nouns_only mode, drop action words entirely
+        if nouns_only and phrase in QUERY_ACTION_WORDS:
             continue
+        if phrase and phrase not in seen:
+            seen.add(phrase)
+            phrases.append(phrase)
 
-        # Split keywords (top 20 comma-separated words, increased from 10)
-        keyword_list = [k.strip() for k in file_keywords.split(",") if k.strip()]
-        
-        if not keyword_list:
-            refined_categories.append(original_category)
-            continue
-        
-        # Encode file keywords into AI embeddings
-        keyword_embeddings = model.encode(keyword_list, convert_to_tensor=True)
-        
-        # Calculate cosine similarity between file keywords and query categories
-        cosine_scores = util.cos_sim(keyword_embeddings, target_embeddings)
-        max_score = torch.max(cosine_scores).item()
-
-        # DECISION: If strong match (> 0.45) → Use query category
-        #           Otherwise → Keep original extension-based category
-        if max_score > 0.45:
-            best_match_idx = torch.argmax(torch.max(cosine_scores, dim=0).values).item()
-            refined_categories.append(target_categories[best_match_idx].capitalize())
-        else:
-            refined_categories.append(original_category)
-
-    # Update DataFrame with new categories
-    df['Category'] = refined_categories
-    _log("✅ Semantic refinement complete!", progress_callback)
-    return df
+    return phrases
 
 
-def organize_files_into_folders(df, destination_folder, progress_callback=None):
+def compute_phrase_vectors(phrases: List[str]) -> Optional[np.ndarray]:
     """
-    AUTOMATIC WORKFLOW: Copy files → Verify → Delete originals
-    No user choice - this is the only mode of operation.
-    
-    SAFETY FEATURE: Always copies first, verifies integrity, then deletes originals.
-    If any step fails, original files are preserved.
-    
-    Args:
-        df: DataFrame with file data
-        destination_folder: Where to organize files
-        progress_callback: Optional function(message) for progress updates
+    Encode *phrases* into a (N, D) embedding matrix.
+
+    Returns ``None`` if *phrases* is empty.
     """
-    
-    if not os.path.exists(destination_folder):
-        os.makedirs(destination_folder)
-        _log(f"📁 Created main folder: {destination_folder}", progress_callback)
+    if not phrases:
+        return None
+    model = get_sentence_model()
+    return model.encode(phrases, convert_to_numpy=True, show_progress_bar=False)
 
-    success_count = 0
-    error_count = 0
-    total_files = len(df)
-    
-    # Track which files were successfully copied
-    copied_files = []  # List of (source_path, dest_path) tuples
-    failed_files = []  # List of failed source paths
 
-    # ===== PHASE 1: COPY ALL FILES =====
-    _log("=" * 50, progress_callback)
-    _log(f"📋 PHASE 1: Copying {total_files} files to destination...", progress_callback)
-    _log("=" * 50, progress_callback)
+def compute_similarity(
+    file_keywords: List[str],
+    query_vectors: np.ndarray,
+    threshold: float,
+) -> Optional[int]:
+    """
+    Find the best-matching query index for *file_keywords*.
 
-    for index, row in df.iterrows():
-        if progress_callback and (index + 1) % 10 == 0:
-            progress_callback(f"📦 Copying: {index + 1}/{total_files} files...")
-            
-        source_path = row['Path']
-        category = row['Category']
-        filename = row['Filename']
+    Parameters
+    ----------
+    file_keywords:
+        Keyword phrases extracted from the file content.
+    query_vectors:
+        (Q, D) embedding matrix of query keyword phrases.
+    threshold:
+        Minimum cosine similarity score (0–1).
 
-        if not os.path.exists(source_path):
-            _log(f"⚠️ Source file not found: {filename}", progress_callback)
-            error_count += 1
-            failed_files.append(source_path)
-            continue
+    Returns
+    -------
+    int or None
+        Index of the best-matching query keyword (with score ≥ *threshold*),
+        or ``None`` if no match exceeds the threshold.
+    """
+    if not file_keywords:
+        return None
 
-        category_folder = os.path.join(destination_folder, category)
-        
-        if not os.path.exists(category_folder):
-            os.makedirs(category_folder)
-        
-        dest_path = os.path.join(category_folder, filename)
+    model = get_sentence_model()
+    file_vecs: np.ndarray = model.encode(
+        file_keywords, convert_to_numpy=True, show_progress_bar=False
+    )
 
-        # Handle duplicates
+    # sim_matrix shape: (len(file_keywords), len(query_keywords))
+    sim_matrix = cosine_similarity(file_vecs, query_vectors)
+    best_score = float(sim_matrix.max())
+
+    if best_score >= threshold:
+        # Which query keyword scored highest (column index)?
+        best_query_idx = int(sim_matrix.max(axis=0).argmax())
+        return best_query_idx
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Safe file operation
+# ---------------------------------------------------------------------------
+
+def safe_copy_then_delete(src: str | Path, dest_dir: str | Path) -> Path:
+    """
+    Copy *src* to *dest_dir* and delete the original only after verification.
+
+    Strategy
+    --------
+    1. Create *dest_dir* (and parents) if needed.
+    2. If a file with the same name already exists in *dest_dir*, append a
+       numeric suffix (``file_1.ext``, ``file_2.ext``, …) to avoid overwriting.
+    3. Copy with ``shutil.copy2`` (preserves timestamps and metadata).
+    4. Compare source and destination file sizes.
+    5. Only if sizes match, remove the original with ``Path.unlink()``.
+    6. If verification fails, the partial copy is removed and an exception
+       is raised so the caller knows the source is still intact.
+
+    Parameters
+    ----------
+    src:
+        Source file path.
+    dest_dir:
+        Destination directory (created if absent).
+
+    Returns
+    -------
+    Path
+        The final destination path of the copied file.
+
+    Raises
+    ------
+    RuntimeError
+        If the copy-verification step fails (size mismatch).
+    """
+    src = Path(src)
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    # Resolve name conflicts
+    dest = dest_dir / src.name
+    if dest.exists():
+        stem, suffix = src.stem, src.suffix
         counter = 1
-        name, ext = os.path.splitext(filename)
-        while os.path.exists(dest_path):
-            dest_path = os.path.join(category_folder, f"{name}_{counter}{ext}")
+        while dest.exists():
+            dest = dest_dir / f"{stem}_{counter}{suffix}"
             counter += 1
 
+    logger.debug("Copying '%s' → '%s'", src.name, dest)
+    shutil.copy2(str(src), str(dest))
+
+    # Verify byte size before deleting source
+    src_size = src.stat().st_size
+    dest_size = dest.stat().st_size
+    if src_size != dest_size:
         try:
-            # Copy file with metadata
-            shutil.copy2(source_path, dest_path)
-            success_count += 1
-            copied_files.append((source_path, dest_path))
-            
-        except Exception as e:
-            _log(f"❌ Error copying {filename}: {e}", progress_callback)
-            error_count += 1
-            failed_files.append(source_path)
+            dest.unlink()
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"Copy verification failed for '{src.name}': "
+            f"source={src_size}B, destination={dest_size}B. "
+            "Source file has NOT been deleted."
+        )
 
-    _log(f"✅ Copy complete: {success_count} files copied, {error_count} errors", progress_callback)
+    src.unlink()
+    logger.debug("Verified and removed original '%s'.", src.name)
+    return dest
 
-    # ===== PHASE 2: VERIFY COPIED FILES =====
-    _log("=" * 50, progress_callback)
-    _log(f"🔍 PHASE 2: Verifying {len(copied_files)} copied files...", progress_callback)
-    _log("=" * 50, progress_callback)
-    
-    verification_passed = True
-    verified_count = 0
-    verification_failed_count = 0
-    failed_verifications = []  # Track which files failed verification
-    
-    for source_path, dest_path in copied_files:
-        try:
-            # Check if destination file exists
-            if not os.path.exists(dest_path):
-                _log(f"❌ Verification failed: {os.path.basename(dest_path)} not found", progress_callback)
-                verification_failed_count += 1
-                verification_passed = False
-                failed_verifications.append((source_path, dest_path))
-                continue
-            
-            # Check if file sizes match
-            source_size = os.path.getsize(source_path)
-            dest_size = os.path.getsize(dest_path)
-            
-            if source_size != dest_size:
-                _log(f"❌ Size mismatch: {os.path.basename(source_path)} (source: {source_size}, dest: {dest_size})", progress_callback)
-                verification_failed_count += 1
-                verification_passed = False
-                failed_verifications.append((source_path, dest_path))
-                continue
-            
-            verified_count += 1
-            
-            if progress_callback and verified_count % 50 == 0:
-                progress_callback(f"✓ Verified: {verified_count}/{len(copied_files)} files...")
-                
-        except Exception as e:
-            _log(f"❌ Verification error for {os.path.basename(source_path)}: {e}", progress_callback)
-            verification_failed_count += 1
-            verification_passed = False
-            failed_verifications.append((source_path, dest_path))
-    
-    _log(f"✅ Verification complete: {verified_count}/{len(copied_files)} files verified", progress_callback)
-    
-    if verification_failed_count > 0:
-        _log(f"⚠️ {verification_failed_count} files failed verification", progress_callback)
 
-    # ===== PHASE 3: DELETE ORIGINAL FILES (only if verification passed) =====
-    if verification_passed and error_count == 0:
-        _log("=" * 50, progress_callback)
-        _log(f"🗑️  PHASE 3: Deleting {len(copied_files)} original files (all verified)...", progress_callback)
-        _log("=" * 50, progress_callback)
-        
-        deleted_count = 0
-        delete_failed_count = 0
-        
-        for source_path, dest_path in copied_files:
+# ---------------------------------------------------------------------------
+# FileOrganizer
+# ---------------------------------------------------------------------------
+
+class FileOrganizer:
+    """
+    Orchestrates the complete file-organisation pipeline.
+
+    Parameters
+    ----------
+    config:
+        An :class:`~ai_file.config.AppConfig` instance.
+
+    Usage
+    -----
+    >>> organizer = FileOrganizer(config)
+    >>> organizer.set_query("annual financial reports 2024")
+    >>> organizer.run(progress_cb=my_progress_fn, log_cb=my_log_fn)
+    """
+
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+        self.categorizer = FileCategorizer(config)
+        self._db_path = Path(config.db_path)
+        self._registry: pd.DataFrame = self._load_registry()
+
+        # NLP state
+        self._query_keywords: List[str] = []
+        self._query_vectors: Optional[np.ndarray] = None
+
+        # Threading controls
+        self._pause_event = threading.Event()
+        self._pause_event.set()         # not paused initially
+        self._cancel_event = threading.Event()
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def set_query(self, query: str) -> None:
+        """
+        Set the user query and pre-compute keyword embeddings.
+
+        Only true noun phrases are kept as keyword folder names — action
+        verbs and function words (e.g. "organise", "match", "find") are
+        filtered out by ``extract_phrases(nouns_only=True)``.
+        """
+        self._query_keywords = extract_phrases(query, nouns_only=True)
+        if not self._query_keywords:
+            # Fallback: raw words minus action words and short tokens
+            self._query_keywords = [
+                w.lower() for w in query.split()
+                if len(w) > 2 and w.lower() not in QUERY_ACTION_WORDS
+            ]
+        logger.info("Query keywords (%d): %s", len(self._query_keywords), self._query_keywords)
+        self._query_vectors = compute_phrase_vectors(self._query_keywords)
+
+    def get_all_files(self, folder: str | Path) -> List[Path]:
+        """
+        Return every file in *folder*.
+
+        Respects ``config.recursive``; non-files (directories, symlinks to
+        directories) are silently skipped.
+        """
+        folder = Path(folder)
+        if not folder.is_dir():
+            logger.warning("'%s' is not a directory — skipping.", folder)
+            return []
+        if self.config.recursive:
+            return [p for p in folder.rglob("*") if p.is_file()]
+        return [p for p in folder.iterdir() if p.is_file()]
+
+    def preview(
+        self,
+        scan_folder: str | Path,
+        output_folder: str | Path,
+    ) -> Dict[str, List[str]]:
+        """
+        Return the projected destination structure without moving files.
+
+        Returns
+        -------
+        Dict[str, List[str]]
+            Mapping of ``category → [destination paths …]``.
+        """
+        files = [str(f) for f in self.get_all_files(scan_folder)]
+        return self.categorizer.preview_structure(files, str(output_folder))
+
+    def run(
+        self,
+        progress_cb: Optional[Callable[[int, int, str], None]] = None,
+        log_cb: Optional[Callable[[str, str], None]] = None,
+    ) -> None:
+        """
+        Run the full organisation pipeline.
+
+        ALL files are processed:
+          - Unsupported extensions  → ``output/Other/``
+          - Supported, unselected category → skipped (left in place)
+          - Supported, selected category → categorised ± keyword folder
+
+        Empty directories in the source folders are removed after the run.
+        """
+        self._cancel_event.clear()
+
+        def emit(level: str, msg: str) -> None:
+            getattr(logger, level.lower(), logger.info)(msg)
+            if log_cb:
+                log_cb(level, msg)
+
+        # Collect ALL files from configured source folders
+        all_files: List[Path] = []
+        for folder in self.config.scan_folders:
+            found = self.get_all_files(folder)
+            emit("INFO", f"Found {len(found)} files in '{folder}'.")
+            all_files.extend(found)
+
+        total = len(all_files)
+        emit("INFO", f"{total} total files to process.")
+
+        if total == 0:
+            emit("WARNING", "No files found. Nothing to do.")
+            return
+
+        output_folder = Path(self.config.output_folder)
+
+        # Submit all tasks to the thread pool
+        with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
+            future_to_path = {
+                pool.submit(self._process_file, fp, output_folder, emit): fp
+                for fp in all_files
+            }
+
+            completed = 0
+            for future in as_completed(future_to_path):
+                fp = future_to_path[future]
+
+                if self._cancel_event.is_set():
+                    emit("INFO", "Cancellation requested — stopping.")
+                    for pending in future_to_path:
+                        pending.cancel()
+                    break
+
+                self._pause_event.wait()
+
+                try:
+                    future.result()
+                except Exception as exc:
+                    emit("ERROR", f"Unhandled error for '{fp.name}': {exc}")
+
+                completed += 1
+                if progress_cb:
+                    progress_cb(completed, total, fp.name)
+
+        self._save_registry()
+        emit("INFO", f"Finished. {completed}/{total} files processed. Registry saved.")
+
+        # Clean up empty directories in source folders
+        removed = self._cleanup_empty_dirs(self.config.scan_folders)
+        if removed:
+            emit("INFO", f"Removed {removed} empty folder(s) from source.")
+
+    # ------------------------------------------------------------------
+    # Controls (called from GUI thread)
+    # ------------------------------------------------------------------
+
+    def pause(self) -> None:
+        """Pause processing after the current batch of futures completes."""
+        self._pause_event.clear()
+        logger.info("Processing paused.")
+
+    def resume(self) -> None:
+        """Resume a paused run."""
+        self._pause_event.set()
+        logger.info("Processing resumed.")
+
+    def cancel(self) -> None:
+        """Request cancellation of the current run."""
+        self._cancel_event.set()
+        self._pause_event.set()     # unblock if currently paused
+        logger.info("Cancellation requested.")
+
+    @property
+    def is_paused(self) -> bool:
+        return not self._pause_event.is_set()
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _process_file(
+        self,
+        file_path: Path,
+        output_folder: Path,
+        emit: Callable[[str, str], None],
+    ) -> None:
+        """
+        Classify and move a single file.
+
+        Routing rules
+        -------------
+        1. Unsupported extension           → ``output/Other/``
+        2. Category not in selected list   → skip (left in place)
+        3. Semantic keyword match          → ``output/<keyword>/`` (top level)
+        4. No match, categorisation on    → ``output/<Category>/``
+        5. No match, categorisation off   → ``output/Unsorted/``
+        """
+        emit("INFO", f"Processing: {file_path.name}")
+
+        # ── 1. Unsupported extension → Other ─────────────────────────────
+        if not is_supported(file_path):
             try:
-                if os.path.exists(source_path):
-                    os.remove(source_path)
-                    deleted_count += 1
-                    
-                    if progress_callback and deleted_count % 50 == 0:
-                        progress_callback(f"🗑️  Deleted: {deleted_count}/{len(copied_files)} original files...")
-                        
-            except Exception as e:
-                _log(f"❌ Failed to delete {os.path.basename(source_path)}: {e}", progress_callback)
-                delete_failed_count += 1
-        
-        _log(f"✅ Deleted {deleted_count} original files", progress_callback)
-        
-        if delete_failed_count > 0:
-            _log(f"⚠️ {delete_failed_count} files could not be deleted (but copies are safe)", progress_callback)
-    else:
-        # Safety mechanism - don't delete if verification failed
-        _log("=" * 50, progress_callback)
-        _log("⚠️ SAFETY: Original files NOT deleted", progress_callback)
-        _log("=" * 50, progress_callback)
-        
-        if not verification_passed:
-            _log(f"❌ Reason: Verification failed for {verification_failed_count} files", progress_callback)
-            _log(f"   Action: Your original files are safe!", progress_callback)
-            _log(f"   Copied files are in: {destination_folder}", progress_callback)
-            _log(f"   Please manually verify and delete originals if needed", progress_callback)
-        
-        if error_count > 0:
-            _log(f"❌ Reason: {error_count} files had copy errors", progress_callback)
-            _log(f"   Action: Your original files are safe!", progress_callback)
-            _log(f"   Successfully copied: {success_count} files", progress_callback)
-            _log(f"   Failed: {error_count} files", progress_callback)
+                dest = safe_copy_then_delete(file_path, output_folder / "Other")
+                self._update_registry(file_path, dest, "Other")
+                emit("INFO", f"  ✓ (unsupported) → Other/{dest.name}")
+            except Exception as exc:
+                emit("ERROR", f"  ✗ Could not move '{file_path.name}' to Other: {exc}")
+            return
 
-    # ===== FINAL SUMMARY =====
-    _log("=" * 50, progress_callback)
-    _log(f"✅ ORGANIZATION COMPLETE!", progress_callback)
-    _log(f"   Files processed: {total_files}", progress_callback)
-    _log(f"   Successfully copied: {success_count}", progress_callback)
-    _log(f"   Copy errors: {error_count}", progress_callback)
-    _log(f"   Files verified: {verified_count}", progress_callback)
-    
-    if verification_passed and error_count == 0:
-        _log(f"   Original files deleted: Yes ✓", progress_callback)
-    else:
-        _log(f"   Original files deleted: No (kept for safety)", progress_callback)
-    
-    _log(f"   Destination: {destination_folder}", progress_callback)
-    _log("=" * 50, progress_callback)
+        # ── 2. Category determination ─────────────────────────────────────
+        if self.config.enable_categorization:
+            category = self.categorizer.get_category(file_path)
+        else:
+            category = "Unsorted"
 
+        # ── 3. Selected-categories check ──────────────────────────────────
+        selected = self.config.selected_categories
+        if selected and category not in selected:
+            emit("INFO", f"  → Skipped (category '{category}' not selected).")
+            return
 
-def get_categories_from_query(user_query):
-    """Extract target nouns from user query."""
-    doc = nlp(user_query)
-    targets = [token.text for token in doc if token.pos_ in ["NOUN", "PROPN"] and not token.is_stop]
-    return targets
+        # ── 4. Preserve structure option ──────────────────────────────────
+        category_folder = output_folder / category
+        if self.config.preserve_structure:
+            for scan_root in self.config.scan_folders:
+                try:
+                    rel = file_path.relative_to(scan_root)
+                    category_folder = category_folder / rel.parent
+                    break
+                except ValueError:
+                    continue
 
+        # ── 5. Semantic keyword matching ──────────────────────────────────
+        dest_folder = category_folder   # default: no match
+        matched_keyword: Optional[str] = None
 
-def organize_files_smart(folder_path, destination_folder, user_query=None, include_subfolders=True, progress_callback=None):
-    """
-    Main orchestration function with progress callbacks.
-    
-    WORKFLOW:
-    1. Scan files → Extension-based categories (Documents, Images, Videos, etc.)
-    2. IF user provides query → Match files to query categories using semantic search
-    3. ELSE → Keep extension-based categories
-    4. Organize files: Copy → Verify → Delete originals
-    
-    Args:
-        folder_path: Source folder to scan
-        destination_folder: Where to organize files
-        user_query: Optional query like "organize by Invoice and Legal"
-        include_subfolders: If True, scan subdirectories; if False, scan only top level
-        progress_callback: Optional function(message) for progress updates
-    """
-    _log("=" * 50, progress_callback)
-    _log("🚀 SMART FILE ORGANIZER", progress_callback)
-    _log("=" * 50, progress_callback)
-    
-    # STEP 1: Scan folder
-    subfolder_msg = "including subfolders" if include_subfolders else "top-level only"
-    _log(f"\n📂 Step 1: Scanning folder ({subfolder_msg})...", progress_callback)
-    df = scan_folder(folder_path, progress_callback, include_subfolders)
-    _log(f"Found {len(df)} files", progress_callback)
-    
-    if len(df) == 0:
-        _log("⚠️ No files found", progress_callback)
-        return df
-    
-    # STEP 2: Category Refinement (ONLY if query provided)
-    if user_query:
-        _log("\n🎯 Step 2: Matching files to query categories...", progress_callback)
-        _log(f"   Query: '{user_query}'", progress_callback)
-        df = refine_categories_with_semantic_search(df, user_query, progress_callback)
-    else:
-        _log("\n📋 Step 2: Using extension-based categories", progress_callback)
-        _log("   (No query provided - files will be organized by type)", progress_callback)
-    
-    # Show category breakdown
-    _log("\n📊 CATEGORY BREAKDOWN:", progress_callback)
-    category_counts = df['Category'].value_counts()
-    for category, count in category_counts.items():
-        _log(f"   • {category}: {count} files", progress_callback)
-    
-    # STEP 3: Organize files (automatic copy-verify-delete)
-    _log(f"\n📦 Step 3: Organizing files (Copy → Verify → Delete)...", progress_callback)
-    organize_files_into_folders(df, destination_folder, progress_callback)
-    
-    _log("\n" + "=" * 50, progress_callback)
-    _log("✅ ALL DONE!", progress_callback)
-    _log("=" * 50, progress_callback)
-    
-    return df
+        if self._query_vectors is not None:
+            try:
+                raw_text = extract_text(file_path)
+                validate_text(raw_text, min_words=self.config.min_word_count)
+                keywords = extract_phrases(raw_text)
+                best_idx = compute_similarity(
+                    keywords, self._query_vectors, self.config.similarity_threshold
+                )
+                if best_idx is not None:
+                    matched_keyword = self._query_keywords[best_idx]
+                    # Query-matched folder lives at OUTPUT root, not inside category
+                    dest_folder = output_folder / matched_keyword
+                    emit("INFO", f"  → Keyword match: '{matched_keyword}'")
+                else:
+                    emit("INFO", "  → No keyword match above threshold.")
+            except Exception as exc:
+                emit("WARNING", f"  Text extraction/matching skipped for '{file_path.name}': {exc}")
 
+        # ── 6. Move the file ──────────────────────────────────────────────
+        try:
+            dest = safe_copy_then_delete(file_path, dest_folder)
+            self._update_registry(file_path, dest, matched_keyword or category)
+            emit("INFO", f"  ✓ → {dest.relative_to(output_folder)}")
+        except Exception as exc:
+            emit("ERROR", f"  ✗ Could not move '{file_path.name}': {exc}")
 
-# Example usage
-if __name__ == "__main__":
-    pass
+    # ---- Empty-directory cleanup ─────────────────────────────────────────
+
+    def _cleanup_empty_dirs(self, folders: List[str]) -> int:
+        """
+        Recursively remove empty directories inside each of *folders*.
+
+        Walks bottom-up so nested empty directories are removed before
+        their parents.  The root scan folder itself is never deleted.
+
+        Returns the number of directories removed.
+        """
+        removed = 0
+        for root_str in folders:
+            root = Path(root_str)
+            if not root.is_dir():
+                continue
+            for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+                dp = Path(dirpath)
+                if dp == root:
+                    continue   # never remove the scan root itself
+                try:
+                    if not any(dp.iterdir()):
+                        dp.rmdir()
+                        removed += 1
+                        logger.debug("Removed empty dir: %s", dp)
+                except Exception as exc:
+                    logger.debug("Could not remove dir '%s': %s", dp, exc)
+        return removed
+
+    # ---- Registry --------------------------------------------------------
+
+    def _update_registry(
+        self, src: Path, dest: Path, category: str
+    ) -> None:
+        """Upsert a file record in the registry DataFrame (thread-safe via GIL)."""
+        mask = self._registry["original_path"] == str(src)
+        row = {
+            "original_path": str(src),
+            "current_path":  str(dest),
+            "file_name":     dest.name,
+            "file_type":     dest.suffix.lower(),
+            "category":      category,
+        }
+        if mask.any():
+            for key, val in row.items():
+                self._registry.loc[mask, key] = val
+        else:
+            self._registry = pd.concat(
+                [self._registry, pd.DataFrame([row])],
+                ignore_index=True,
+            )
+
+    def _load_registry(self) -> pd.DataFrame:
+        """Load the pickle registry, or return an empty DataFrame."""
+        if self._db_path.exists():
+            try:
+                with open(self._db_path, "rb") as f:
+                    data = pickle.load(f)
+                if isinstance(data, pd.DataFrame):
+                    logger.info("Registry loaded: %d records from '%s'.", len(data), self._db_path)
+                    return data
+            except Exception as exc:
+                logger.warning("Could not load registry from '%s': %s — starting fresh.", self._db_path, exc)
+
+        return pd.DataFrame(
+            columns=["original_path", "current_path", "file_name", "file_type", "category"]
+        )
+
+    def _save_registry(self) -> None:
+        """Persist the registry DataFrame to disk."""
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(self._db_path, "wb") as f:
+                pickle.dump(self._registry, f)
+            logger.debug("Registry saved: %d records → '%s'.", len(self._registry), self._db_path)
+        except Exception as exc:
+            logger.error("Failed to save registry: %s", exc)

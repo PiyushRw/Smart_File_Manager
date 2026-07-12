@@ -1,10 +1,34 @@
-customtkinter>=5.2.0
-pandas>=2.0.0
-easyocr>=1.7.0
-spacy>=3.7.0
-sentence-transformers>=2.2.0
-faster-whisper>=0.10.0
-moviepy>=1.0.3
-markitdown>=0.0.1
-torch>=2.0.0
-Pillow>=10.0.0
+# ai_file — requirements
+# Install with: pip install -r requirements.txt
+
+# ── Core NLP & embeddings ──────────────────────────────────────────────────
+spacy>=3.7,<4.0
+# After installing spacy, download the model:
+#   python -m spacy download en_core_web_sm
+sentence-transformers>=2.7,<4.0   # replaces fasttext; lightweight & GPU-capable
+scikit-learn>=1.4                  # cosine_similarity
+numpy>=1.24
+
+# ── Document extraction ────────────────────────────────────────────────────
+pdfplumber>=0.10                   # PDF text extraction
+python-docx>=1.1                   # .docx
+python-pptx>=0.6                   # .pptx
+pandas>=2.0                        # .xlsx, .csv
+openpyxl>=3.1                      # Excel engine for pandas
+
+# ── OCR & audio ───────────────────────────────────────────────────────────
+easyocr>=1.7                       # image / scanned-page OCR (GPU-aware)
+faster-whisper>=1.0                # audio + video transcription (GPU-aware)
+moviepy>=1.0                       # video → audio extraction
+pillow>=10.0                       # PIL images for OCR fallback
+
+# ── Web / markup parsing ──────────────────────────────────────────────────
+beautifulsoup4>=4.12               # HTML parsing
+lxml>=5.0                          # fast XML / HTML parser backend
+
+# ── GPU acceleration (optional — CPU fallback if not installed) ────────────
+# Install the CUDA-enabled build for your CUDA version from pytorch.org:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# For CPU-only:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.1                         # GPU detection + sentence-transformers backend

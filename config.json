@@ -1,0 +1,172 @@
+{
+  "scan_folders": [
+    "C:/Users/piyu1/Downloads"
+  ],
+  "output_folder": "",
+  "db_path": "C:\\Users\\piyu1\\OneDrive\\Documents\\Code\\filo\\ai_file\\file_registry.pkl",
+  "recursive": true,
+  "enable_categorization": true,
+  "categories": {
+    "Documents": [
+      ".pdf",
+      ".docx",
+      ".doc",
+      ".txt",
+      ".odt",
+      ".rtf",
+      ".md",
+      ".tex",
+      ".pages"
+    ],
+    "Spreadsheets": [
+      ".xlsx",
+      ".xls",
+      ".csv",
+      ".ods",
+      ".numbers"
+    ],
+    "Presentations": [
+      ".pptx",
+      ".ppt",
+      ".odp",
+      ".key"
+    ],
+    "Images": [
+      ".jpg",
+      ".jpeg",
+      ".png",
+      ".bmp",
+      ".gif",
+      ".webp",
+      ".tiff",
+      ".tif",
+      ".svg",
+      ".ico",
+      ".heic",
+      ".raw"
+    ],
+    "Videos": [
+      ".mp4",
+      ".avi",
+      ".mov",
+      ".mkv",
+      ".wmv",
+      ".flv",
+      ".webm",
+      ".m4v",
+      ".3gp",
+      ".ts"
+    ],
+    "Audio": [
+      ".mp3",
+      ".wav",
+      ".m4a",
+      ".flac",
+      ".ogg",
+      ".aac",
+      ".wma",
+      ".opus"
+    ],
+    "Archives": [
+      ".zip",
+      ".tar",
+      ".gz",
+      ".bz2",
+      ".7z",
+      ".rar",
+      ".xz",
+      ".zst"
+    ],
+    "Code": [
+      ".py",
+      ".js",
+      ".ts",
+      ".java",
+      ".c",
+      ".cpp",
+      ".h",
+      ".hpp",
+      ".cs",
+      ".go",
+      ".rs",
+      ".rb",
+      ".php",
+      ".swift",
+      ".kt",
+      ".r",
+      ".m",
+      ".sh",
+      ".bat",
+      ".ps1",
+      ".lua",
+      ".pl",
+      ".scala"
+    ],
+    "Executables": [
+      ".exe",
+      ".msi",
+      ".app",
+      ".deb",
+      ".rpm",
+      ".dmg",
+      ".apk",
+      ".bin"
+    ],
+    "Web": [
+      ".html",
+      ".htm",
+      ".xml",
+      ".json",
+      ".yaml",
+      ".yml",
+      ".css",
+      ".toml"
+    ],
+    "Email": [
+      ".eml",
+      ".msg"
+    ],
+    "Databases": [
+      ".sql",
+      ".db",
+      ".sqlite",
+      ".sqlite3",
+      ".mdb",
+      ".accdb"
+    ],
+    "Fonts": [
+      ".ttf",
+      ".otf",
+      ".woff",
+      ".woff2"
+    ]
+  },
+  "excluded_extensions": [],
+  "selected_categories": [
+    "Documents",
+    "Spreadsheets",
+    "Presentations",
+    "Images",
+    "Videos",
+    "Audio",
+    "Archives",
+    "Code",
+    "Executables",
+    "Web",
+    "Email",
+    "Databases",
+    "Fonts",
+    "Other",
+    "Misc"
+  ],
+  "copy_then_delete": true,
+  "preserve_structure": false,
+  "sentence_model": "all-MiniLM-L6-v2",
+  "similarity_threshold": 0.45,
+  "min_word_count": 5,
+  "whisper_model_size": "base",
+  "use_gpu": true,
+  "theme": "dark",
+  "max_log_lines": 2000,
+  "max_workers": 4
+}
