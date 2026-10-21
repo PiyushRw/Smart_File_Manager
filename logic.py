@@ -194,6 +194,49 @@ def compute_similarity(
 
 
 # ---------------------------------------------------------------------------
+# Smart text sampling  (filename → start/end snippet → first 500 chars)
+# ---------------------------------------------------------------------------
+
+_SAMPLE_START = 500   # characters taken from the beginning of extracted text
+_SAMPLE_END   = 200   # characters taken from the end of extracted text
+
+
+def build_match_text(
+    file_path: Path,
+    full_text: str,
+) -> str:
+    """
+    Assemble a compact match-text from three layers, in priority order:
+
+    1. **Filename stem** — always included (highest signal for most files).
+    2. **Start snippet** — first :data:`_SAMPLE_START` chars of *full_text*.
+    3. **End snippet**   — last  :data:`_SAMPLE_END`   chars of *full_text*
+       (captures conclusions / signatures that are semantically rich).
+
+    The three parts are joined and returned as a single string that can be
+    fed directly to :func:`extract_phrases`.
+    """
+    parts: List[str] = []
+
+    # 1. Filename (stem without extension, underscores/hyphens → spaces)
+    stem = file_path.stem.replace("_", " ").replace("-", " ")
+    if stem.strip():
+        parts.append(stem)
+
+    # 2 & 3. Start + end of the text body
+    if full_text and full_text.strip():
+        start = full_text[:_SAMPLE_START].strip()
+        if start:
+            parts.append(start)
+        if len(full_text) > _SAMPLE_START + _SAMPLE_END:
+            end = full_text[-_SAMPLE_END:].strip()
+            if end:
+                parts.append(end)
+
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # Safe file operation
 # ---------------------------------------------------------------------------
 
@@ -512,19 +555,36 @@ class FileOrganizer:
 
         if self._query_vectors is not None:
             try:
-                raw_text = extract_text(file_path)
-                validate_text(raw_text, min_words=self.config.min_word_count)
-                keywords = extract_phrases(raw_text)
+                # ── Smart extraction: filename → start/end snippet → first 500 chars ──
+                # Step 1: Try filename alone first (fast, zero extraction cost)
+                stem_text = file_path.stem.replace("_", " ").replace("-", " ")
+                stem_keywords = extract_phrases(stem_text)
                 best_idx = compute_similarity(
-                    keywords, self._query_vectors, self.config.similarity_threshold
-                )
+                    stem_keywords, self._query_vectors, self.config.similarity_threshold
+                ) if stem_keywords else None
+
                 if best_idx is not None:
                     matched_keyword = self._query_keywords[best_idx]
+                    emit("INFO", f"  → Keyword match (filename): '{matched_keyword}'")
+                else:
+                    # Step 2 & 3: Extract text → build sample (start+end) → match
+                    raw_text = extract_text(file_path)
+                    validate_text(raw_text, min_words=self.config.min_word_count)
+                    sample_text = build_match_text(file_path, raw_text)
+                    keywords = extract_phrases(sample_text)
+                    best_idx = compute_similarity(
+                        keywords, self._query_vectors, self.config.similarity_threshold
+                    )
+                    if best_idx is not None:
+                        matched_keyword = self._query_keywords[best_idx]
+                        emit("INFO", f"  → Keyword match (content sample): '{matched_keyword}'")
+                    else:
+                        emit("INFO", "  → No keyword match above threshold.")
+
+                if matched_keyword is not None:
                     # Query-matched folder lives at OUTPUT root, not inside category
                     dest_folder = output_folder / matched_keyword
-                    emit("INFO", f"  → Keyword match: '{matched_keyword}'")
-                else:
-                    emit("INFO", "  → No keyword match above threshold.")
+
             except Exception as exc:
                 emit("WARNING", f"  Text extraction/matching skipped for '{file_path.name}': {exc}")
 

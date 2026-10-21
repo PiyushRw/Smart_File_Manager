@@ -1,7 +1,7 @@
 """
-run.py — Entry point for ai_file.
+run.py — Entry point for Smart File Manager.
 
-Run from inside the ai_file/ folder:
+Run from inside the project folder:
     python run.py
 
 CLI mode:
@@ -23,13 +23,16 @@ import sys
 from pathlib import Path
 
 # ── sys.path fix ─────────────────────────────────────────────────────────────
-# When this file is executed from inside ai_file/, Python adds ai_file/ to
-# sys.path by default.  We need the PARENT of ai_file/ (i.e. filo/) on the
-# path so that  "import ai_file"  resolves correctly as a package.
-_HERE = Path(__file__).resolve().parent          # …/filo/ai_file
-_PROJECT_ROOT = _HERE.parent                     # …/filo
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
+# This file lives inside the package folder itself.  To allow
+# "import <package_folder_name>" from outside, we add the PARENT of this
+# folder to sys.path.  We also add THIS folder so that direct
+# "from config import ..." fallback imports work when running run.py directly.
+_HERE = Path(__file__).resolve().parent          # …/smart file manager
+_PARENT = _HERE.parent                           # parent directory
+for _p in (_PARENT, _HERE):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+_PKG_NAME = _HERE.name                           # folder name = package name
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -101,12 +104,12 @@ def main() -> None:
     args = parser.parse_args()
 
     # ── Logging ──────────────────────────────────────────────────────────
-    from ai_file.utils import setup_logging
+    from utils import setup_logging  # type: ignore[import]
     level = logging.DEBUG if args.debug else logging.INFO
     setup_logging(log_file=args.log_file, level=level)
 
     # ── Config ───────────────────────────────────────────────────────────
-    from ai_file.config import AppConfig
+    from config import AppConfig  # type: ignore[import]
     config_path = Path(args.config) if args.config else None
     config = AppConfig.load(config_path) if config_path else AppConfig.load()
 
@@ -129,7 +132,7 @@ def main() -> None:
         if not config.output_folder:
             parser.error("CLI mode requires an --output folder.")
 
-        from ai_file.logic import FileOrganizer
+        from logic import FileOrganizer  # type: ignore[import]
         organizer = FileOrganizer(config)
 
         query = args.query.strip()
@@ -143,7 +146,7 @@ def main() -> None:
         sys.exit(0)
 
     else:
-        from ai_file.gui import launch
+        from gui import launch  # type: ignore[import]
         launch(config)
 
 
